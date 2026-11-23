@@ -1,223 +1,242 @@
-"""Early Dip + Late Rally, trailing-exit edition (btc-race-24h-20261123-0511, slot 1).
+"""BTC race bot -- btc-race-24h-20261123-0511 (slot 1).
 
-Evolved from the grind-max champion hy-tp50-late100 ("Early Dip + Late Rally"):
-the fixed +50 bps take-profit is replaced by a trailing exit, so a strong
-trend day is ridden instead of sold at +0.50%.
+Strategy: "Early Dip + Late Rally", trailing-exit edition.
 
-Phase 1 (bars 0-59): buy all-in on dip >= 23 bps vs race OPEN.
-  Exit (trailing): arms once close reaches +50 bps above fill, then sells
-  on a 25 bps give-back from the post-entry peak.
-Phase 2 (bars 1380+, only if Phase 1 never triggered): buy all-in on dip
-  >= 50 bps vs the 60-bar peak close; hold to close.
-Fallback (bar 1410, only if still flat): market buy, only if close < OPEN.
-Late round (after a Phase-1 sale, bars 1380+): buy once if close dips
-  >= 100 bps below OPEN and the day high exceeded OPEN +50 bps; hold to close.
-Max 2 filled buys. No stop loss. Deterministic, integer math, stdlib only.
+The bot trades cbBTC/USDC minute by minute on the agent-fun/bars-replay/v1
+protocol (hello + one batch per minute, answers with buy/sell orders).
+Python 3.13, standard library only, deterministic integer math, no network,
+no wall clock, no files outside the repository.
 
-Gate results (exact replay, fee 4 bps + slippage 2 bps + pool impact):
-  dev 0511 (this race, FRESH): +$15.73, 1 buy + 1 sell, max DD 0.53%
-  dev 0828: +$0.11 | dev 0603: +$0.90 | live 0828: +$18.87 (2 rounds)
-  live 0603: -$2.50 | worst-case -$2.50, 5-window mean +$6.62.
-  (Fixed-TP +0.50% champion on dev 0511: +$3.02. Fixed TP >= +0.75% scores
-  -$40.43 on dev 0828 and was rejected: it never exits on a down day.)
+Rules of the strategy
+---------------------
+* Phase 1 (bars 0-59): buy all-in when the close dips >= 0.23% below the
+  race OPEN (the open of bar 0). Exit is a trailing stop: it arms once the
+  post-entry peak reaches +0.50% above the buy's fill price, and sells when
+  the close gives back 0.25% from that peak.
+* Phase 2 (bars 1380+, only if Phase 1 never triggered): buy all-in when
+  the close dips >= 0.50% below the peak close of the last 60 bars; hold
+  to the close of the window.
+* Fallback (bar 1410, only if still flat, i.e. no buy ever filled): market
+  buy, but only when the close is below the race OPEN.
+* Late round (bars 1380+, after a Phase-1 sale): buy once when the close
+  dips >= 1.00% below the race OPEN and the day's high has at some point
+  exceeded OPEN + 0.50%; hold to the close of the window.
+* At most 2 filled buys. No stop loss.
+
+Fills land one bar after the decision, at the next bar's open, so every
+threshold is judged on the close the batch just delivered. All comparisons
+are integer cross-multiplications, never floats, so two runs on the same
+data answer every batch identically.
 """
 
 import os
 import sys
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-)
-
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
 SYMBOL = "CBBTC"
+BPS = 10_000
 
-PHASE1_END = 59
-DIP1_NUM = 9977
-TAKE_PROFIT_NUM = 10050
-PHASE1_TRAIL_BPS = 25
-PHASE2_START = 1380
-DIP2_NUM = 9950
+# Largest move the fill may make from the latest close we were sent, in
+# basis points. The modelled slippage (2 bps) plus the pool impact of an
+# all-in order is far below this, so the cap never binds on this window;
+# it only guards against a fill landing absurdly far from the close.
+MAX_SLIPPAGE_BPS = 300
+
+# Phase 1: dip vs the race OPEN, in bps, and the last bar it may fire on.
+PHASE1_DIP_BPS = 23
+PHASE1_LAST_BAR = 59
+
+# Trailing exit: arm level above the fill, in bps, and the give-back from
+# the post-entry peak that triggers the sale, in bps.
+TRAIL_ARM_BPS = 50
+TRAIL_GIVEBACK_BPS = 25
+
+# Late window: first bar of Phase 2 / the late round, and the fallback bar.
+LATE_START_BAR = 1380
 FALLBACK_BAR = 1410
-FALLBACK_COND = 1
-LATE_DIP_OPEN_NUM = 9900
-LATE_HIGH_NUM = 10050
-LAST_SEQ = 1439
 
-SLIPPAGE_BPS = 300
-MIN_ORDER = 1_000_000
+# Phase 2: dip vs the peak close of the last 60 bars, in bps.
+PHASE2_DIP_BPS = 50
+PHASE2_PEAK_BARS = 60
 
-_open0 = None
-_day_high = 0
-_closes = []
-_buy_pending = False
-_pending_phase1 = False
-_pending_late = False
-_sell_pending = False
-_buy_price = None
-_peak1 = None
-_armed1 = False
-_phase1 = False
-_holding = False
-_sold = False
-_late_bought = False
+# Late round: dip below the race OPEN, in bps, and how far above the race
+# OPEN the day's high must have reached, in bps.
+LATE_DIP_BPS = 100
+DAY_HIGH_BPS = 50
+
+# Hard cap on filled buys over the whole window. A buy counts toward the
+# cap only once its fill lands, never when the order is merely sent.
+MAX_FILLED_BUYS = 2
 
 
-def _reset():
-    global _open0, _day_high, _closes, _buy_pending, _pending_phase1
-    global _pending_late, _sell_pending, _buy_price, _peak1, _armed1
-    global _phase1, _holding, _sold, _late_bought
-    _open0 = None
-    _day_high = 0
-    _closes = []
-    _buy_pending = False
-    _pending_phase1 = False
-    _pending_late = False
-    _sell_pending = False
-    _buy_price = None
-    _peak1 = None
-    _armed1 = False
-    _phase1 = False
-    _holding = False
-    _sold = False
-    _late_bought = False
+class Strategy:
+    """The bot's memory: everything it has learned from the batches so far."""
 
+    def __init__(self):
+        # The race OPEN: the open of bar 0, learned from the first batch.
+        self.race_open = None
+        # Highest high of any bar seen so far (the day high).
+        self.day_high = None
+        # Last PHASE2_PEAK_BARS closes, oldest first, for the Phase-2 peak.
+        self.recent_closes = []
+        # True once a Phase-1 buy order has been sent.
+        self.phase1_triggered = False
+        # True once a Phase-1 trailing sale has been sent.
+        self.phase1_sold = False
+        # True once the one late-round buy has been sent.
+        self.late_bought = False
+        # Number of buy orders that actually filled.
+        self.buys_filled = 0
+        # Fill price of the buy currently held, at the symbol's price scale.
+        self.fill_price = None
+        # Highest close since the current entry (the trailing peak). It
+        # starts at the fill price, so the peak is never below the entry.
+        self.peak = None
+        # True once the peak has reached the arm level above the fill.
+        self.armed = False
 
-def on_hello(state):
-    _reset()
+    def note_bar(self, bar):
+        """Fold one fresh bar into the rolling history."""
+        close = int(bar["c"])
+        high = int(bar["h"])
+        if self.race_open is None:
+            # Bar 0: its open is the race OPEN every dip is measured from.
+            self.race_open = int(bar["o"])
+        if self.day_high is None or high > self.day_high:
+            self.day_high = high
+        self.recent_closes.append(close)
+        if len(self.recent_closes) > PHASE2_PEAK_BARS:
+            self.recent_closes.pop(0)
+        return close
 
+    def note_fills(self, fills):
+        """Fold the batch's fills in: count buys, learn the fill price."""
+        for fill in fills:
+            if fill.get("status") != "filled":
+                continue
+            if fill.get("symbol") != SYMBOL:
+                continue
+            if fill.get("side") == "buy":
+                self.buys_filled += 1
+                self.fill_price = int(fill["price"])
+                self.peak = self.fill_price
+                self.armed = False
 
-def _buy_all_in(state, phase1, late=False):
-    global _buy_pending, _pending_phase1, _pending_late
-    size = state.cash
-    room = state.weight_room(SYMBOL)
-    if size > room:
-        size = room
-    if size < MIN_ORDER:
-        return []
-    _buy_pending = True
-    _pending_phase1 = phase1
-    _pending_late = late
-    return [
-        {
-            "side": "buy",
-            "symbol": SYMBOL,
-            "notional_quote_units": size,
-            "max_slippage_bps": SLIPPAGE_BPS,
-        }
-    ]
+    def dip_vs(self, price, reference, dip_bps):
+        """True when price sits at least dip_bps below reference.
 
+        Written as a cross-multiplication so no float ever appears:
+        price <= reference * (10000 - dip_bps) / 10000.
+        """
+        return price * BPS <= reference * (BPS - dip_bps)
 
-def _sell_all(state):
-    global _sell_pending
-    holding = state.positions.get(SYMBOL)
-    if holding is None or holding.qty <= 0:
-        return []
-    _sell_pending = True
-    return [
-        {
-            "side": "sell",
-            "symbol": SYMBOL,
-            "qty": holding.qty,
-            "max_slippage_bps": SLIPPAGE_BPS,
-        }
-    ]
-
-
-def _bar_for(batch):
-    for b in batch["bars"]:
-        if b["symbol"] == SYMBOL:
-            return b
-    return None
+    def rise_vs(self, price, reference, rise_bps):
+        """True when price sits strictly more than rise_bps above reference."""
+        return price * BPS > reference * (BPS + rise_bps)
 
 
 def on_batch(state, batch):
-    global _open0, _day_high, _closes, _buy_pending, _pending_phase1
-    global _pending_late, _sell_pending, _buy_price, _peak1, _armed1
-    global _phase1, _holding, _sold, _late_bought
-    bar = _bar_for(batch)
+    """Decide the orders for one batch; None or [] means no orders."""
+    bar = None
+    for candidate in batch.get("bars", []):
+        if candidate.get("symbol") == SYMBOL:
+            bar = candidate
+            break
     if bar is None:
+        # CBBTC missed this minute: nothing to decide on.
         return []
 
-    if _open0 is None:
-        _open0 = int(bar["o"])
-    _day_high = max(_day_high, int(bar["h"]))
-
-    for f in batch.get("fills", []):
-        if f.get("symbol") != SYMBOL:
-            continue
-        side = f.get("side")
-        status = f.get("status")
-        if side == "buy" and status == "filled":
-            _buy_price = int(f["price"])
-            _peak1 = _buy_price
-            _armed1 = False
-            _phase1 = _pending_phase1
-            _holding = True
-            _buy_pending = False
-            if _pending_late:
-                _late_bought = True
-        elif side == "buy" and status == "rejected":
-            _buy_pending = False
-        elif side == "sell" and status == "filled":
-            _sold = True
-            _holding = False
-            _sell_pending = False
-        elif side == "sell" and status == "rejected":
-            _sell_pending = False
-
-    if state.warming_up:
-        return []
-
-    if _buy_pending or _sell_pending:
-        return []
-
-    close = int(bar["c"])
+    bot = state.strategy
+    close = bot.note_bar(bar)
+    bot.note_fills(batch.get("fills", []))
     seq = state.seq
-    _closes.append(close)
 
-    if _holding:
-        if _phase1 and _buy_price is not None:
-            if close > _peak1:
-                _peak1 = close
-            if PHASE1_TRAIL_BPS:
-                if close * 10000 >= _buy_price * 10050:
-                    _armed1 = True
-                if _armed1 and close * 10000 <= _peak1 * (10000 - PHASE1_TRAIL_BPS):
-                    return _sell_all(state)
-            else:
-                if close * 10000 >= _buy_price * TAKE_PROFIT_NUM:
-                    return _sell_all(state)
+    holding = state.positions.get(SYMBOL)
+    if holding is not None and holding.qty > 0:
+        # --- Trailing exit on the open position. ---
+        if bot.peak is not None:
+            if close > bot.peak:
+                bot.peak = close
+            if bot.fill_price is not None and bot.rise_vs(
+                bot.peak, bot.fill_price, TRAIL_ARM_BPS
+            ):
+                # The peak has cleared +0.50% above the fill: armed.
+                bot.armed = True
+            if bot.armed and bot.dip_vs(close, bot.peak, TRAIL_GIVEBACK_BPS):
+                # Give-back of 0.25% from the peak: sell the whole position.
+                bot.phase1_sold = True
+                return [
+                    {
+                        "side": "sell",
+                        "symbol": SYMBOL,
+                        "qty": holding.qty,
+                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                    }
+                ]
         return []
 
-    if seq >= LAST_SEQ:
+    # Flat: no open position. A buy is possible only while warming-up is
+    # over and the filled-buy cap still has room.
+    if state.warming_up or bot.buys_filled >= MAX_FILLED_BUYS:
         return []
-    if _sold:
-        # late round only: bars 1380+, dip vs OPEN + day-high condition
-        if (not _late_bought and LATE_DIP_OPEN_NUM and seq >= PHASE2_START
-                and close * 10000 <= _open0 * LATE_DIP_OPEN_NUM
-                and _day_high * 10000 > _open0 * LATE_HIGH_NUM):
-            return _buy_all_in(state, phase1=False, late=True)
-        return []
-    if seq <= PHASE1_END:
-        if close * 10000 <= _open0 * DIP1_NUM:
-            return _buy_all_in(state, phase1=True)
-        return []
-    if seq >= FALLBACK_BAR:
-        if FALLBACK_COND == 1 and close >= _open0:
-            return []
-        if FALLBACK_COND == 2:
-            peak = max(_closes[-60:])
-            if close * 10000 > peak * 9950:
-                return []
-        return _buy_all_in(state, phase1=False)
-    if seq >= PHASE2_START:
-        peak = max(_closes[-61:])
-        if close * 10000 <= peak * DIP2_NUM:
-            return _buy_all_in(state, phase1=False)
-        return []
-    return []
+
+    order = None
+    if not bot.phase1_triggered and seq <= PHASE1_LAST_BAR:
+        # --- Phase 1: early dip vs the race OPEN. ---
+        if bot.dip_vs(close, bot.race_open, PHASE1_DIP_BPS):
+            order = {
+                "side": "buy",
+                "symbol": SYMBOL,
+                "notional_quote_units": state.cash,
+                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            }
+            bot.phase1_triggered = True
+    elif seq >= LATE_START_BAR:
+        if not bot.phase1_triggered:
+            # --- Phase 2: dip vs the 60-bar peak close. ---
+            peak_close = max(bot.recent_closes)
+            if bot.dip_vs(close, peak_close, PHASE2_DIP_BPS):
+                order = {
+                    "side": "buy",
+                    "symbol": SYMBOL,
+                    "notional_quote_units": state.cash,
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }
+                bot.phase1_triggered = True
+        elif bot.phase1_sold and not bot.late_bought:
+            # --- Late round: deep dip after a strong day. ---
+            if bot.dip_vs(close, bot.race_open, LATE_DIP_BPS) and bot.rise_vs(
+                bot.day_high, bot.race_open, DAY_HIGH_BPS
+            ):
+                order = {
+                    "side": "buy",
+                    "symbol": SYMBOL,
+                    "notional_quote_units": state.cash,
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }
+                bot.late_bought = True
+        if order is None and seq == FALLBACK_BAR:
+            # --- Fallback: still flat at bar 1410, buy if below OPEN. ---
+            if (
+                not bot.phase1_triggered
+                and bot.buys_filled == 0
+                and close < bot.race_open
+            ):
+                order = {
+                    "side": "buy",
+                    "symbol": SYMBOL,
+                    "notional_quote_units": state.cash,
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }
+
+    return [order] if order is not None else []
+
+
+def on_hello(state):
+    """Attach the strategy memory to the run's state before batch 0."""
+    state.strategy = Strategy()
 
 
 makefun_bars.run(on_batch, on_hello=on_hello)
